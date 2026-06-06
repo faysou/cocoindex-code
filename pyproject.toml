@@ -80,6 +80,9 @@ packages = ["src/cocoindex_code"]
 [tool.hatch.build.targets.sdist]
 include = ["/src", "/README.md", "/LICENSE"]
 
+[tool.uv.sources]
+cocoindex = { path = "../cocoindex", editable = true }
+
 [dependency-groups]
 dev = [
     "pytest>=7.0.0",
