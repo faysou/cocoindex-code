@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import io
+import json
+import re
+from io import StringIO
 from pathlib import Path
 
 import pytest
+from typer.testing import CliRunner
 
 from cocoindex_code import cli
 from cocoindex_code.cli import (
@@ -15,7 +19,6 @@ from cocoindex_code.cli import (
     resolve_default_path,
 )
 from cocoindex_code.protocol import SearchResponse, SearchResult
-
 
 def test_print_search_results_replaces_unencodable_console_characters(
     monkeypatch: pytest.MonkeyPatch,
@@ -45,6 +48,13 @@ def test_print_search_results_replaces_unencodable_console_characters(
     assert "可编码内容" in output
     assert "File: notes?.md" in output
     assert "left ? right" in output
+
+
+_ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+
+
+def _strip_ansi(text: str) -> str:
+    return _ANSI_RE.sub("", text)
 
 
 def test_require_project_root_success(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -196,6 +206,213 @@ def test_resolve_default_path_outside_project(
     monkeypatch.chdir(other)
     result = resolve_default_path(project_root)
     assert result is None
+
+
+def test_search_help_includes_json_option() -> None:
+    runner = CliRunner()
+
+    result = runner.invoke(cli.app, ["search", "--help"], catch_exceptions=False)
+
+    assert result.exit_code == 0
+    output = _strip_ansi(result.output)
+    assert "--json" in output
+
+
+def test_bridge_help_includes_jsonrpc_option() -> None:
+    runner = CliRunner()
+
+    result = runner.invoke(cli.app, ["bridge", "--help"], catch_exceptions=False)
+
+    assert result.exit_code == 0
+    assert "--jsonrpc" in _strip_ansi(result.output)
+
+
+def test_print_search_results_json_outputs_machine_readable_payload(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    response = SearchResponse(
+        success=True,
+        results=[
+            SearchResult(
+                file_path="src/main.py",
+                language="python",
+                content="def main():\n    return 1",
+                start_line=10,
+                end_line=11,
+                score=0.875,
+            )
+        ],
+        total_returned=1,
+        offset=5,
+        message=None,
+    )
+
+    cli.print_search_results_json(response)
+
+    assert json.loads(capsys.readouterr().out) == {
+        "success": True,
+        "results": [
+            {
+                "file_path": "src/main.py",
+                "language": "python",
+                "content": "def main():\n    return 1",
+                "start_line": 10,
+                "end_line": 11,
+                "score": 0.875,
+            }
+        ],
+        "total_returned": 1,
+        "offset": 5,
+        "message": None,
+    }
+
+
+def test_jsonrpc_bridge_ping_and_shutdown() -> None:
+    input_stream = StringIO(
+        '{"jsonrpc":"2.0","id":1,"method":"ping"}\n'
+        '{"jsonrpc":"2.0","id":2,"method":"shutdown"}\n'
+        '{"jsonrpc":"2.0","id":3,"method":"ping"}\n'
+    )
+    output_stream = StringIO()
+
+    def fake_search(
+        project_root: str,
+        query: str,
+        languages: list[str] | None = None,
+        paths: list[str] | None = None,
+        limit: int = 5,
+        offset: int = 0,
+        on_waiting: object | None = None,
+    ) -> SearchResponse:
+        raise AssertionError("search should not be called")
+
+    cli.run_jsonrpc_bridge(input_stream, output_stream, fake_search)
+
+    responses = [json.loads(line) for line in output_stream.getvalue().splitlines()]
+    assert responses == [
+        {"jsonrpc": "2.0", "id": 1, "result": {"ok": True}},
+        {"jsonrpc": "2.0", "id": 2, "result": {"ok": True}},
+    ]
+
+
+def test_jsonrpc_bridge_search_uses_client_payload() -> None:
+    input_stream = StringIO(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": "search-1",
+                "method": "search",
+                "params": {
+                    "project_root": "/workspace",
+                    "query": "stream writer",
+                    "languages": ["python"],
+                    "paths": ["src/*"],
+                    "limit": 3,
+                    "offset": 2,
+                },
+            }
+        )
+        + "\n"
+    )
+    output_stream = StringIO()
+    calls: list[dict[str, object]] = []
+
+    def fake_search(
+        project_root: str,
+        query: str,
+        languages: list[str] | None = None,
+        paths: list[str] | None = None,
+        limit: int = 5,
+        offset: int = 0,
+        on_waiting: object | None = None,
+    ) -> SearchResponse:
+        calls.append(
+            {
+                "project_root": project_root,
+                "query": query,
+                "languages": languages,
+                "paths": paths,
+                "limit": limit,
+                "offset": offset,
+            }
+        )
+        return SearchResponse(
+            success=True,
+            results=[
+                SearchResult(
+                    file_path="src/main.py",
+                    language="python",
+                    content="def stream_writer(): pass",
+                    start_line=4,
+                    end_line=4,
+                    score=0.9,
+                )
+            ],
+            total_returned=1,
+            offset=2,
+            message=None,
+        )
+
+    cli.run_jsonrpc_bridge(input_stream, output_stream, fake_search)
+
+    assert calls == [
+        {
+            "project_root": "/workspace",
+            "query": "stream writer",
+            "languages": ["python"],
+            "paths": ["src/*"],
+            "limit": 3,
+            "offset": 2,
+        }
+    ]
+    response = json.loads(output_stream.getvalue())
+    assert response == {
+        "jsonrpc": "2.0",
+        "id": "search-1",
+        "result": {
+            "success": True,
+            "results": [
+                {
+                    "file_path": "src/main.py",
+                    "language": "python",
+                    "content": "def stream_writer(): pass",
+                    "start_line": 4,
+                    "end_line": 4,
+                    "score": 0.9,
+                }
+            ],
+            "total_returned": 1,
+            "offset": 2,
+            "message": None,
+        },
+    }
+
+
+def test_jsonrpc_bridge_returns_parse_error() -> None:
+    input_stream = StringIO("{not json}\n")
+    output_stream = StringIO()
+
+    def fake_search(
+        project_root: str,
+        query: str,
+        languages: list[str] | None = None,
+        paths: list[str] | None = None,
+        limit: int = 5,
+        offset: int = 0,
+        on_waiting: object | None = None,
+    ) -> SearchResponse:
+        raise AssertionError("search should not be called")
+
+    cli.run_jsonrpc_bridge(input_stream, output_stream, fake_search)
+
+    assert json.loads(output_stream.getvalue()) == {
+        "jsonrpc": "2.0",
+        "id": None,
+        "error": {
+            "code": -32700,
+            "message": "Parse error",
+        },
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -550,3 +767,42 @@ def test_resolve_embedding_choice_validates_st_model(
     assert callable(validate)
     assert validate("ollama/nomic-embed-text") is not True  # rejected (returns message)
     assert validate("Snowflake/snowflake-arctic-embed-xs") is True
+
+
+def test_reset_deletes_turbovec_cache_sidecars(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_root = tmp_path / "project"
+    db_dir = project_root / ".cocoindex_code"
+    db_dir.mkdir(parents=True)
+    (db_dir / "settings.yml").write_text("include_patterns: []")
+    settings_dir = tmp_path / "ccc_home"
+    settings_dir.mkdir()
+    (settings_dir / "global_settings.yml").write_text(
+        "embedding:\n  model: test\n  provider: litellm\n"
+    )
+    monkeypatch.setenv("COCOINDEX_CODE_DIR", str(settings_dir))
+    monkeypatch.chdir(project_root)
+
+    deleted_names = [
+        "target_turboquant.tvim",
+        "target_turboquant.tvim.cache",
+        "target_turboquant.tvim.aarch64-neon-v1.cache",
+        "target_turbovec.tvim",
+        "target_turbovec.tvim.cache",
+        "target_turbovec.tvim.scalar-v1.cache",
+    ]
+    for name in deleted_names:
+        (db_dir / name).write_bytes(b"data")
+    preserved_path = db_dir / "target_turboquant.tvim.not-cache"
+    preserved_path.write_bytes(b"data")
+
+    runner = CliRunner()
+    result = runner.invoke(cli.app, ["reset", "-f"], catch_exceptions=False)
+
+    assert result.exit_code == 0
+    assert "Databases deleted" in result.output
+    for name in deleted_names:
+        assert not (db_dir / name).exists()
+    assert preserved_path.exists()
