@@ -80,8 +80,11 @@ DEFAULT_EXCLUDED_PATTERNS: list[str] = [
     "**/__pycache__",  # Python cache
     "**/node_modules",  # Node.js dependencies
     "**/target",  # Rust/Maven build output
+    "**/target-*",  # Rust build variants like target-v2
+    "**/target-*/**",  # Contents of Rust build variants
     "**/build/assets",  # Build assets directories
     "**/dist",  # Distribution directories
+    "**/*.min.js",  # Minified bundles
     "**/vendor/*.*/*",  # Go vendor directory (domain-based paths)
     "**/vendor/*",  # PHP vendor directory
     "**/.cocoindex_code",  # Our own index directory
@@ -152,6 +155,12 @@ class ChunkerMapping:
 
 
 @dataclass
+class VectorSearchSettings:
+    backend: str = "sqlite_vec"  # "sqlite_vec" or "turboquant"
+    bit_width: int = 4
+
+
+@dataclass
 class ProjectSettings:
     include_patterns: list[str] = field(default_factory=lambda: list(DEFAULT_INCLUDED_PATTERNS))
     exclude_patterns: list[str] = field(default_factory=lambda: list(DEFAULT_EXCLUDED_PATTERNS))
@@ -159,6 +168,7 @@ class ProjectSettings:
     chunkers: list[ChunkerMapping] = field(default_factory=list)
     #: Files larger than this many bytes are excluded. ``None`` means no limit.
     max_file_size: int | None = None
+    vector_search: VectorSearchSettings = field(default_factory=VectorSearchSettings)
 
 
 # ---------------------------------------------------------------------------
@@ -318,12 +328,18 @@ def _reset_host_path_mapping_cache() -> None:
 
 
 _TARGET_SQLITE_DB_NAME = "target_sqlite.db"
+_TARGET_TURBOQUANT_INDEX_NAME = "target_turboquant.tvim"
 _COCOINDEX_DB_NAME = "cocoindex.db"
 
 
 def target_sqlite_db_path(project_root: Path) -> Path:
     """Return the path to the vector index SQLite database for a project."""
     return resolve_db_dir(project_root) / _TARGET_SQLITE_DB_NAME
+
+
+def target_turboquant_index_path(project_root: Path) -> Path:
+    """Return the path to the optional TurboQuant vector index."""
+    return resolve_db_dir(project_root) / _TARGET_TURBOQUANT_INDEX_NAME
 
 
 def cocoindex_db_path(project_root: Path) -> Path:
@@ -566,6 +582,10 @@ def _project_settings_to_dict(settings: ProjectSettings) -> dict[str, Any]:
     d: dict[str, Any] = {
         "include_patterns": settings.include_patterns,
         "exclude_patterns": settings.exclude_patterns,
+        "vector_search": {
+            "backend": settings.vector_search.backend,
+            "bit_width": settings.vector_search.bit_width,
+        },
     }
     if settings.max_file_size is not None:
         d["max_file_size"] = settings.max_file_size
@@ -585,12 +605,22 @@ def _project_settings_from_dict(d: dict[str, Any]) -> ProjectSettings:
     chunkers = [ChunkerMapping(ext=cm["ext"], module=cm["module"]) for cm in d.get("chunkers", [])]
     raw_max_size = d.get("max_file_size")
     max_file_size = None if raw_max_size is None else parse_file_size(raw_max_size)
+    vector_search_dict = d.get("vector_search") or {}
+    vector_search = VectorSearchSettings(
+        backend=vector_search_dict.get("backend", "sqlite_vec"),
+        bit_width=int(vector_search_dict.get("bit_width", 4)),
+    )
+    if vector_search.backend not in {"sqlite_vec", "turboquant"}:
+        raise ValueError("vector_search.backend must be either 'sqlite_vec' or 'turboquant'")
+    if vector_search.bit_width not in {2, 3, 4}:
+        raise ValueError("vector_search.bit_width must be 2, 3, or 4")
     return ProjectSettings(
         include_patterns=d.get("include_patterns", list(DEFAULT_INCLUDED_PATTERNS)),
         exclude_patterns=d.get("exclude_patterns", list(DEFAULT_EXCLUDED_PATTERNS)),
         language_overrides=overrides,
         chunkers=chunkers,
         max_file_size=max_file_size,
+        vector_search=vector_search,
     )
 
 

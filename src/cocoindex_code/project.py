@@ -11,6 +11,7 @@ from typing import Any
 
 import cocoindex as coco
 from cocoindex.connectors import sqlite as coco_sqlite
+from cocoindex.connectors import turboquant
 
 from .chunking import CHUNKER_REGISTRY, ChunkerFn
 from .indexer import indexer_main
@@ -28,10 +29,14 @@ from .settings import (
     cocoindex_db_path as _cocoindex_db_path,
 )
 from .settings import (
+    load_project_settings,
     resolve_db_dir,
 )
 from .settings import (
     target_sqlite_db_path as _target_sqlite_db_path,
+)
+from .settings import (
+    target_turboquant_index_path as _target_turboquant_index_path,
 )
 from .shared import (
     CODEBASE_DIR,
@@ -115,6 +120,7 @@ class Project:
                     if on_progress is not None:
                         on_progress(progress)
                     await asyncio.sleep(0.1)
+            await self._warm_turboquant_index()
         finally:
             try:
                 if self._clear_mps_cache_after_index:
@@ -125,6 +131,18 @@ class Project:
             finally:
                 self._initial_index_done.set()
                 self._indexing_stats = None
+
+    async def _warm_turboquant_index(self) -> None:
+        project_settings = load_project_settings(self._project_root)
+        if project_settings.vector_search.backend != "turboquant":
+            return
+        index_path = _target_turboquant_index_path(self._project_root)
+        if index_path.exists():
+            await asyncio.to_thread(turboquant.load_index, index_path)
+
+    async def warm_search_caches(self) -> None:
+        """Eagerly warm local search caches for this project."""
+        await self._warm_turboquant_index()
 
     async def ensure_indexing_started(self) -> None:
         """Kick off background indexing and wait until it is active or queued.
@@ -153,6 +171,9 @@ class Project:
         """
         if self._index_lock.locked():
             yield IndexWaitingNotice()
+            await self.wait_for_indexing_done()
+            yield IndexResponse(success=True)
+            return
 
         progress_queue: asyncio.Queue[IndexingProgress] = asyncio.Queue()
         index_task = asyncio.create_task(
@@ -183,8 +204,45 @@ class Project:
 
     @property
     def should_wait_for_indexing(self) -> bool:
-        """True if indexing has been started but not yet completed."""
-        return not self._initial_index_done.is_set()
+        """True if an indexing run is active."""
+        return self._index_lock.locked()
+
+    def has_searchable_index(self) -> bool:
+        """True when an existing SQLite index can serve searches."""
+        project_settings = load_project_settings(self._project_root)
+        if (
+            project_settings.vector_search.backend == "turboquant"
+            and not _target_turboquant_index_path(self._project_root).exists()
+        ):
+            return False
+        table_name = (
+            "code_chunks"
+            if project_settings.vector_search.backend == "turboquant"
+            else "code_chunks_vec"
+        )
+        db = self._env.get_context(SQLITE_DB)
+        try:
+            with db.readonly() as conn:
+                row = conn.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()
+                if row is not None and row[0] > 0:
+                    return True
+        except sqlite3.OperationalError:
+            pass
+
+        target_db = _target_sqlite_db_path(self._project_root)
+        if not target_db.is_file():
+            return False
+        try:
+            with sqlite3.connect(f"file:{target_db}?mode=ro", uri=True) as conn:
+                fallback_table = (
+                    "code_chunks"
+                    if project_settings.vector_search.backend == "turboquant"
+                    else "code_chunks_vec_rowids"
+                )
+                row = conn.execute(f"SELECT COUNT(*) FROM {fallback_table}").fetchone()
+        except sqlite3.Error:
+            return False
+        return row is not None and row[0] > 0
 
     async def wait_for_indexing_done(self) -> None:
         """Wait until initial indexing is complete and no indexing is running."""
@@ -207,6 +265,7 @@ class Project:
         target_db = _target_sqlite_db_path(self._project_root)
         results = await query_codebase(
             query=query,
+            project_root=self._project_root,
             target_sqlite_db_path=target_db,
             env=self._env,
             limit=limit,
@@ -236,14 +295,20 @@ class Project:
         """Get index stats by querying the SQLite database."""
         db = self._env.get_context(SQLITE_DB)
         index_exists = True
+        project_settings = load_project_settings(self._project_root)
+        table_name = (
+            "code_chunks"
+            if project_settings.vector_search.backend == "turboquant"
+            else "code_chunks_vec"
+        )
         try:
             with db.readonly() as conn:
-                total_chunks = conn.execute("SELECT COUNT(*) FROM code_chunks_vec").fetchone()[0]
+                total_chunks = conn.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0]
                 total_files = conn.execute(
-                    "SELECT COUNT(DISTINCT file_path) FROM code_chunks_vec"
+                    f"SELECT COUNT(DISTINCT file_path) FROM {table_name}"
                 ).fetchone()[0]
                 lang_rows = conn.execute(
-                    "SELECT language, COUNT(*) as cnt FROM code_chunks_vec"
+                    f"SELECT language, COUNT(*) as cnt FROM {table_name}"
                     " GROUP BY language ORDER BY cnt DESC"
                 ).fetchall()
         except sqlite3.OperationalError:

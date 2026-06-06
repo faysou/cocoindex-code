@@ -22,6 +22,7 @@ from cocoindex_code.settings import (
     LanguageOverride,
     ProjectSettings,
     UserSettings,
+    VectorSearchSettings,
     _reset_db_path_mapping_cache,
     _reset_host_path_mapping_cache,
     _user_settings_from_dict,
@@ -70,6 +71,8 @@ def test_default_project_settings() -> None:
     assert s.include_patterns == DEFAULT_INCLUDED_PATTERNS
     assert s.exclude_patterns == DEFAULT_EXCLUDED_PATTERNS
     assert s.language_overrides == []
+    assert s.vector_search.backend == "sqlite_vec"
+    assert s.vector_search.bit_width == 4
 
 
 def test_default_included_patterns_cover_dart() -> None:
@@ -147,6 +150,7 @@ def test_save_and_load_project_settings(tmp_path: Path) -> None:
         include_patterns=["**/*.py", "**/*.rs"],
         exclude_patterns=["**/target"],
         language_overrides=[LanguageOverride(ext="inc", lang="php")],
+        vector_search=VectorSearchSettings(backend="turboquant", bit_width=4),
     )
     save_project_settings(tmp_path, settings)
     loaded = load_project_settings(tmp_path)
@@ -155,6 +159,8 @@ def test_save_and_load_project_settings(tmp_path: Path) -> None:
     assert len(loaded.language_overrides) == 1
     assert loaded.language_overrides[0].ext == "inc"
     assert loaded.language_overrides[0].lang == "php"
+    assert loaded.vector_search.backend == "turboquant"
+    assert loaded.vector_search.bit_width == 4
 
 
 @pytest.mark.usefixtures("_patch_user_dir")

@@ -25,9 +25,11 @@ from cocoindex_code.settings import (
     _reset_db_path_mapping_cache,
     default_project_settings,
     find_parent_with_marker,
+    load_project_settings,
     load_user_settings,
     save_project_settings,
     save_user_settings,
+    target_sqlite_db_path,
     user_settings_path,
 )
 
@@ -202,6 +204,33 @@ def test_session_happy_path(e2e_project: Path) -> None:
     result = runner.invoke(app, ["daemon", "status"], catch_exceptions=False)
     assert result.exit_code == 0, result.output
     assert "Daemon version:" in result.output
+
+
+def test_session_turboquant_index_metadata_schema(e2e_project: Path) -> None:
+    """Init → enable TurboQuant → index → metadata schema matches expected columns."""
+    result = runner.invoke(app, ["init"], catch_exceptions=False)
+    assert result.exit_code == 0, result.output
+
+    settings = load_project_settings(e2e_project)
+    settings.vector_search.backend = "turboquant"
+    settings.vector_search.bit_width = 4
+    save_project_settings(e2e_project, settings)
+
+    result = runner.invoke(app, ["index"], catch_exceptions=False)
+    assert result.exit_code == 0, result.output
+    assert "error: 0" in result.output
+    assert "Chunks:" in result.output
+
+    conn = coco_sqlite.connect(str(target_sqlite_db_path(e2e_project)), load_vec=True)
+    try:
+        with conn.readonly() as db:
+            columns = [row[1] for row in db.execute("PRAGMA table_info(code_chunks)")]
+            chunks = db.execute("SELECT COUNT(*) FROM code_chunks").fetchone()[0]
+    finally:
+        conn.close()
+
+    assert columns == ["id", "file_path", "language", "content", "start_line", "end_line"]
+    assert chunks > 0
 
 
 def test_session_incremental_index(e2e_project: Path) -> None:

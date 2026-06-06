@@ -481,6 +481,12 @@ async def _check_index_status(project_root_str: str) -> DoctorCheckResult:
     from cocoindex.connectors import sqlite as coco_sqlite
 
     project_root = Path(project_root_str)
+    project_settings = load_project_settings(project_root)
+    table_name = (
+        "code_chunks"
+        if project_settings.vector_search.backend == "turboquant"
+        else "code_chunks_vec"
+    )
     db_path = target_sqlite_db_path(project_root)
     details = [f"Index: {format_path_for_display(db_path)}"]
 
@@ -492,11 +498,11 @@ async def _check_index_status(project_root_str: str) -> DoctorCheckResult:
         conn = coco_sqlite.connect(str(db_path), load_vec=True)
         try:
             with conn.readonly() as db:
-                total_chunks = db.execute("SELECT COUNT(*) FROM code_chunks_vec").fetchone()[0]
-                file_rows = db.execute("SELECT DISTINCT file_path FROM code_chunks_vec").fetchall()
+                total_chunks = db.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0]
+                file_rows = db.execute(f"SELECT DISTINCT file_path FROM {table_name}").fetchall()
                 total_files = len(file_rows)
                 lang_rows = db.execute(
-                    "SELECT language, COUNT(*) FROM code_chunks_vec GROUP BY language"
+                    f"SELECT language, COUNT(*) FROM {table_name} GROUP BY language"
                 ).fetchall()
                 languages = {row[0]: row[1] for row in lang_rows}
         finally:
@@ -538,7 +544,9 @@ async def _dispatch(
 
         if isinstance(req, SearchRequest):
             project = await registry.get_project(req.project_root)
-            await project.ensure_indexing_started()
+
+            if not project.has_searchable_index():
+                await project.ensure_indexing_started()
 
             if project.should_wait_for_indexing:
                 return _search_with_wait(project, req)
@@ -561,7 +569,7 @@ async def _dispatch(
 
         if isinstance(req, ProjectStatusRequest):
             project = await registry.get_project(req.project_root)
-            await project.ensure_indexing_started()
+            await project.warm_search_caches()
             return project.get_status()
 
         if isinstance(req, DaemonStatusRequest):

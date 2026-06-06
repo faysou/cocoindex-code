@@ -28,6 +28,7 @@ from cocoindex_code.protocol import (
     IndexWaitingNotice,
     ProjectStatusRequest,
     RemoveProjectRequest,
+    RemoveProjectResponse,
     Response,
     SearchRequest,
     SearchResponse,
@@ -224,6 +225,60 @@ def test_daemon_search_after_index(daemon_sock: str, daemon_project: str) -> Non
     conn.close()
 
 
+def test_daemon_search_uses_existing_index_without_refresh(daemon_sock: str) -> None:
+    """A plain search on an indexed project should not start indexing."""
+    project = Path(tempfile.mkdtemp(prefix="ccc_reload_search_"))
+    save_project_settings(project, default_project_settings())
+    (project / "main.py").write_text(SAMPLE_MAIN_PY)
+
+    conn1, _ = _connect_and_handshake(daemon_sock)
+    conn1.send_bytes(encode_request(IndexRequest(project_root=str(project))))
+    _updates, final = _recv_index_response(conn1)
+    assert final.success is True
+    conn1.close()
+
+    conn_remove, _ = _connect_and_handshake(daemon_sock)
+    conn_remove.send_bytes(encode_request(RemoveProjectRequest(project_root=str(project))))
+    resp = decode_response(conn_remove.recv_bytes())
+    assert isinstance(resp, RemoveProjectResponse)
+    assert resp.ok is True
+    conn_remove.close()
+
+    conn2, _ = _connect_and_handshake(daemon_sock)
+    conn2.send_bytes(encode_request(SearchRequest(project_root=str(project), query="fibonacci")))
+    resp = decode_response(conn2.recv_bytes())
+    assert isinstance(resp, SearchResponse)
+    assert resp.success is True
+    assert len(resp.results) > 0
+    conn2.close()
+
+    conn3, _ = _connect_and_handshake(daemon_sock)
+    conn3.send_bytes(encode_request(DaemonStatusRequest()))
+    status = decode_response(conn3.recv_bytes())
+    projects = {p.project_root: p for p in status.projects}
+    assert projects[str(project)].indexing is False
+    conn3.close()
+
+
+def test_project_status_does_not_start_indexing(daemon_sock: str) -> None:
+    project = Path(tempfile.mkdtemp(prefix="ccc_status_no_index_"))
+    save_project_settings(project, default_project_settings())
+    (project / "main.py").write_text(SAMPLE_MAIN_PY)
+
+    conn1, _ = _connect_and_handshake(daemon_sock)
+    conn1.send_bytes(encode_request(ProjectStatusRequest(project_root=str(project))))
+    resp = decode_response(conn1.recv_bytes())
+    assert resp.index_exists is False
+    conn1.close()
+
+    conn2, _ = _connect_and_handshake(daemon_sock)
+    conn2.send_bytes(encode_request(DaemonStatusRequest()))
+    status = decode_response(conn2.recv_bytes())
+    projects = {p.project_root: p for p in status.projects}
+    assert projects[str(project)].indexing is False
+    conn2.close()
+
+
 def test_index_streams_progress(daemon_sock: str) -> None:
     """Indexing a new project should stream IndexProgressUpdate before IndexResponse."""
     project = Path(tempfile.mkdtemp(prefix="ccc_strm_"))
@@ -239,6 +294,33 @@ def test_index_streams_progress(daemon_sock: str) -> None:
     assert len(updates) > 0, "Expected at least one IndexProgressUpdate"
     for u in updates:
         assert u.progress.num_execution_starts >= 0
+
+
+def test_concurrent_index_request_waits_without_second_pass(daemon_sock: str) -> None:
+    project = Path(tempfile.mkdtemp(prefix="ccc_idx_wait_"))
+    save_project_settings(project, default_project_settings())
+    for i in range(40):
+        (project / f"module_{i}.py").write_text(
+            f'"""Module {i}."""\n\ndef func_{i}(x: int) -> int:\n'
+            f'    """Compute something for module {i}."""\n'
+            f"    return x * {i} + {i}\n"
+        )
+
+    conn1, _ = _connect_and_handshake(daemon_sock)
+    conn1.send_bytes(encode_request(IndexRequest(project_root=str(project))))
+
+    conn2, _ = _connect_and_handshake(daemon_sock)
+    conn2.send_bytes(encode_request(IndexRequest(project_root=str(project))))
+
+    first_resp = decode_response(conn2.recv_bytes())
+    assert isinstance(first_resp, IndexWaitingNotice)
+    updates2, final2 = _recv_index_response(conn2)
+    assert updates2 == []
+    assert final2.success is True
+
+    _recv_index_response(conn1)
+    conn1.close()
+    conn2.close()
 
 
 def test_daemon_remove_project(daemon_sock: str, daemon_project: str) -> None:

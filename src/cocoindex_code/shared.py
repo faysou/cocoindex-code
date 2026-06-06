@@ -183,8 +183,8 @@ def create_embedder(
 
 
 @dataclass
-class CodeChunk:
-    """Schema for storing code chunks in SQLite."""
+class CodeChunkMetadata:
+    """Schema for storing code chunk metadata in SQLite."""
 
     id: int
     file_path: str
@@ -192,4 +192,10 @@ class CodeChunk:
     content: str
     start_line: int
     end_line: int
+
+
+@dataclass
+class CodeChunk(CodeChunkMetadata):
+    """Schema for storing code chunks and embeddings in sqlite-vec."""
+
     embedding: Annotated[npt.NDArray[np.float32], EMBEDDER]

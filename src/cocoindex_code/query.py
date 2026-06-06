@@ -8,7 +8,11 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+from cocoindex.connectors import turboquant
+
 from .schema import QueryResult
+from .settings import load_project_settings, target_turboquant_index_path
 from .shared import EMBEDDER, QUERY_EMBED_PARAMS, SQLITE_DB
 
 
@@ -62,15 +66,12 @@ def _extract_keywords(query: str) -> list[str]:
     Uses regex tokenization to handle code-like terms (e.g. ``io``, ``db``,
     ``async_handler``) better than naive whitespace splitting.
     """
-    return [
-        tok
-        for tok in _TOKEN_RE.findall(query.lower())
-        if len(tok) >= _MIN_KEYWORD_LENGTH
-    ]
+    return [tok for tok in _TOKEN_RE.findall(query.lower()) if len(tok) >= _MIN_KEYWORD_LENGTH]
 
 
 def _keyword_query(
     conn: sqlite3.Connection,
+    table_name: str,
     keywords: list[str],
     limit: int,
     languages: list[str] | None = None,
@@ -88,8 +89,7 @@ def _keyword_query(
 
     # Build per-keyword CASE expressions
     match_expr = " + ".join(
-        "(CASE WHEN INSTR(LOWER(content), ?) > 0 THEN 1 ELSE 0 END)"
-        for _ in keywords
+        "(CASE WHEN INSTR(LOWER(content), ?) > 0 THEN 1 ELSE 0 END)" for _ in keywords
     )
     params.extend(keywords)
 
@@ -118,7 +118,7 @@ def _keyword_query(
         WITH scored AS (
             SELECT file_path, language, content, start_line, end_line,
                    ({match_expr}) AS match_count
-            FROM code_chunks_vec
+            FROM {table_name}
             {where}
         )
         SELECT file_path, language, content, start_line, end_line, match_count
@@ -173,16 +173,28 @@ def _fuse_rrf(
     for key, rrf_score in ranked[:limit]:
         if key in vector_map:
             r = vector_map[key]
-            results.append(QueryResult(
-                file_path=r.file_path, language=r.language, content=r.content,
-                start_line=r.start_line, end_line=r.end_line, score=rrf_score,
-            ))
+            results.append(
+                QueryResult(
+                    file_path=r.file_path,
+                    language=r.language,
+                    content=r.content,
+                    start_line=r.start_line,
+                    end_line=r.end_line,
+                    score=rrf_score,
+                )
+            )
         elif key in keyword_map:
             fp, lang, content, sl, el, _ = keyword_map[key]
-            results.append(QueryResult(
-                file_path=fp, language=lang, content=content,
-                start_line=sl, end_line=el, score=rrf_score,
-            ))
+            results.append(
+                QueryResult(
+                    file_path=fp,
+                    language=lang,
+                    content=content,
+                    start_line=sl,
+                    end_line=el,
+                    score=rrf_score,
+                )
+            )
     return results
 
 
@@ -193,30 +205,24 @@ def _knn_query(
     language: str | None = None,
 ) -> list[tuple[Any, ...]]:
     """Run a vec0 KNN query, optionally constrained to a language partition."""
+    conditions = ["embedding MATCH ?", "k = ?"]
+    params: list[Any] = [embedding_bytes, k]
     if language is not None:
-        return _checked(
-            conn.execute(
-                """
-                SELECT file_path, language, content, start_line, end_line, distance
-                FROM code_chunks_vec
-                WHERE embedding MATCH ? AND k = ? AND language = ?
-                ORDER BY distance
-                """,
-                (embedding_bytes, k, language),
-            ).fetchall(),
-            f"knn language={language!r}",
-        )
+        conditions.append("language = ?")
+        params.append(language)
+
+    query_shape = f"knn language={language!r}" if language is not None else "knn unfiltered"
     return _checked(
         conn.execute(
-            """
+            f"""
             SELECT file_path, language, content, start_line, end_line, distance
             FROM code_chunks_vec
-            WHERE embedding MATCH ? AND k = ?
+            WHERE {" AND ".join(conditions)}
             ORDER BY distance
             """,
-            (embedding_bytes, k),
+            params,
         ).fetchall(),
-        "knn unfiltered",
+        query_shape,
     )
 
 
@@ -264,8 +270,127 @@ def _full_scan_query(
     ).fetchall()
 
 
+def _filtered_ids(
+    conn: sqlite3.Connection,
+    table_name: str,
+    languages: list[str] | None,
+    paths: list[str] | None,
+    exclude_paths: list[str] | None,
+) -> list[int] | None:
+    conditions: list[str] = []
+    params: list[Any] = []
+
+    if languages:
+        placeholders = ",".join("?" for _ in languages)
+        conditions.append(f"language IN ({placeholders})")
+        params.extend(languages)
+
+    if paths:
+        path_clauses = " OR ".join("file_path GLOB ?" for _ in paths)
+        conditions.append(f"({path_clauses})")
+        params.extend(paths)
+
+    if exclude_paths:
+        exclude_clauses = " AND ".join("file_path NOT GLOB ?" for _ in exclude_paths)
+        conditions.append(f"({exclude_clauses})")
+        params.extend(exclude_paths)
+
+    if not conditions:
+        return None
+
+    where = f"WHERE {' AND '.join(conditions)}"
+    return [int(row[0]) for row in conn.execute(f"SELECT id FROM {table_name} {where}", params)]
+
+
+def _metadata_by_id(
+    conn: sqlite3.Connection,
+    table_name: str,
+    ids: list[int],
+) -> dict[int, tuple[str, str, str, int, int]]:
+    if not ids:
+        return {}
+    placeholders = ",".join("?" for _ in ids)
+    rows = conn.execute(
+        f"""
+        SELECT id, file_path, language, content, start_line, end_line
+        FROM {table_name}
+        WHERE id IN ({placeholders})
+        """,
+        ids,
+    ).fetchall()
+    return {
+        int(row_id): (file_path, language, content, start_line, end_line)
+        for row_id, file_path, language, content, start_line, end_line in rows
+    }
+
+
+def _query_turboquant(
+    conn: sqlite3.Connection,
+    project_root: Path,
+    bit_width: int,
+    query_embedding: Any,
+    limit: int,
+    offset: int,
+    languages: list[str] | None,
+    paths: list[str] | None,
+    exclude_paths: list[str] | None,
+) -> list[QueryResult]:
+    index_path = target_turboquant_index_path(project_root)
+    if not index_path.exists():
+        raise RuntimeError(
+            f"TurboQuant index not found at {index_path}. Run `ccc index` to build it."
+        )
+
+    allowed_ids = _filtered_ids(conn, "code_chunks", languages, paths, exclude_paths)
+    if allowed_ids is not None and not allowed_ids:
+        return []
+
+    query_array = np.ascontiguousarray(np.asarray(query_embedding, dtype=np.float32).reshape(1, -1))
+    allowlist = (
+        None
+        if allowed_ids is None
+        else np.ascontiguousarray(np.asarray(allowed_ids, dtype=np.uint64))
+    )
+    index = turboquant.load_index(index_path)
+    scores, ids = index.search(query_array, limit + offset, allowlist=allowlist)
+    scores_array = np.asarray(scores, dtype=np.float32).reshape(-1)
+    ids_array = np.asarray(ids, dtype=np.uint64).reshape(-1)
+    if offset:
+        scores_array = scores_array[offset:]
+        ids_array = ids_array[offset:]
+    if len(ids_array) > limit:
+        scores_array = scores_array[:limit]
+        ids_array = ids_array[:limit]
+
+    metadata = _metadata_by_id(conn, "code_chunks", [int(row_id) for row_id in ids_array])
+    results: list[QueryResult] = []
+    for score, row_id in zip(scores_array, ids_array, strict=True):
+        row = metadata.get(int(row_id))
+        if row is None:
+            continue
+        file_path, language, content, start_line, end_line = row
+        results.append(
+            QueryResult(
+                file_path=file_path,
+                language=language,
+                content=content,
+                start_line=start_line,
+                end_line=end_line,
+                score=float(score),
+            )
+        )
+    return results
+
+
+def _language_candidates(languages: list[str] | None) -> list[str | None]:
+    if languages:
+        return list(languages)
+    return [None]
+
+
 async def query_codebase(
     query: str,
+    project_root: Path,
     target_sqlite_db_path: Path,
     env: Any,
     limit: int = 10,
@@ -307,10 +432,35 @@ async def query_codebase(
     # applied *after* fusion.
     vector_fetch_limit = limit * 3 if mode == "hybrid" else limit
 
+    project_settings = load_project_settings(project_root)
+    vector_table_name = (
+        "code_chunks"
+        if project_settings.vector_search.backend == "turboquant"
+        else "code_chunks_vec"
+    )
+
     with db.readonly() as conn:
-        if paths or exclude_paths:
+        if project_settings.vector_search.backend == "turboquant":
+            vector_results = _query_turboquant(
+                conn,
+                project_root,
+                project_settings.vector_search.bit_width,
+                query_embedding,
+                vector_fetch_limit,
+                offset,
+                languages,
+                paths,
+                exclude_paths,
+            )
+        elif paths or exclude_paths:
             rows = _full_scan_query(
-                conn, embedding_bytes, vector_fetch_limit, offset, languages, paths, exclude_paths,
+                conn,
+                embedding_bytes,
+                vector_fetch_limit,
+                offset,
+                languages,
+                paths,
+                exclude_paths,
             )
         elif not languages or len(languages) == 1:
             lang = languages[0] if languages else None
@@ -321,33 +471,40 @@ async def query_codebase(
                 fetch_k,
                 (
                     row
-                    for lang in languages
+                    for lang in _language_candidates(languages)
                     for row in _knn_query(conn, embedding_bytes, fetch_k, lang)
                 ),
                 key=lambda r: r[5],
             )
 
-    if not paths and not exclude_paths:
-        rows = rows[offset:]
+    if project_settings.vector_search.backend != "turboquant":
+        if not paths and not exclude_paths:
+            rows = rows[offset:]
 
-    vector_results = [
-        QueryResult(
-            file_path=file_path,
-            language=language,
-            content=content,
-            start_line=start_line,
-            end_line=end_line,
-            score=_l2_to_score(distance),
-        )
-        for file_path, language, content, start_line, end_line, distance in rows
-    ]
+        vector_results = [
+            QueryResult(
+                file_path=file_path,
+                language=language,
+                content=content,
+                start_line=start_line,
+                end_line=end_line,
+                score=_l2_to_score(distance),
+            )
+            for file_path, language, content, start_line, end_line, distance in rows
+        ]
 
     if mode == "hybrid":
         keywords = _extract_keywords(query)
         if keywords:
             with db.readonly() as conn:
                 keyword_rows = _keyword_query(
-                    conn, keywords, limit * 3, languages, paths, exclude_paths,
+                    conn,
+                    vector_table_name,
+                    keywords,
+                    limit * 3,
+                    languages,
+                    paths,
+                    exclude_paths,
                 )
             return _fuse_rrf(vector_results, keyword_rows, limit)
 
