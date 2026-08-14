@@ -20,6 +20,7 @@ from cocoindex_code.cli import (
 )
 from cocoindex_code.protocol import SearchResponse, SearchResult
 
+
 def test_print_search_results_replaces_unencodable_console_characters(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -216,6 +217,15 @@ def test_search_help_includes_json_option() -> None:
     assert result.exit_code == 0
     output = _strip_ansi(result.output)
     assert "--json" in output
+
+
+def test_index_help_includes_dry_option() -> None:
+    runner = CliRunner()
+
+    result = runner.invoke(cli.app, ["index", "--help"], catch_exceptions=False)
+
+    assert result.exit_code == 0
+    assert "--dry" in _strip_ansi(result.output)
 
 
 def test_bridge_help_includes_jsonrpc_option() -> None:

@@ -17,6 +17,7 @@ from cocoindex.connectors import sqlite as coco_sqlite
 from cocoindex.connectors import turboquant
 
 from .chunking import CHUNKER_REGISTRY, LoadedChunker
+from .index_changes import create_file_manifest_app, prepare_file_manifest
 from .indexer import indexer_main
 from .protocol import (
     IndexingProgress,
@@ -42,6 +43,7 @@ from .settings import (
     target_turboquant_index_path as _target_turboquant_index_path,
 )
 from .shared import (
+    APP_NAME,
     CODEBASE_DIR,
     EMBEDDER,
     INDEXING_EMBED_PARAMS,
@@ -87,6 +89,7 @@ def _use_empty_context_default_executor(loop: asyncio.AbstractEventLoop) -> None
 class Project:
     _env: coco.Environment
     _app: coco.App[[], None]
+    _file_manifest_app: coco.App[[], None]
     _project_root: Path
     _index_lock: asyncio.Lock
     _clear_mps_cache_after_index: bool
@@ -153,6 +156,7 @@ class Project:
                     if on_progress is not None:
                         on_progress(progress)
                     await asyncio.sleep(0.1)
+            await self._file_manifest_app.update()
             await self._warm_turboquant_index()
         finally:
             try:
@@ -421,9 +425,12 @@ class Project:
         # executor threads from holding on to the environment once this project is closed.
         _use_empty_context_default_executor(asyncio.get_running_loop())
 
+        target_db = coco_sqlite.connect(str(target_sqlite_db), load_vec=True)
+        prepare_file_manifest(target_db)
+
         context = coco.ContextProvider()
         context.provide(CODEBASE_DIR, project_root)
-        context.provide(SQLITE_DB, coco_sqlite.connect(str(target_sqlite_db), load_vec=True))
+        context.provide(SQLITE_DB, target_db)
         context.provide(EMBEDDER, embedder)
         context.provide(INDEXING_EMBED_PARAMS, dict(indexing_params))
         context.provide(QUERY_EMBED_PARAMS, dict(query_params))
@@ -432,7 +439,7 @@ class Project:
         env = coco.Environment(settings, context_provider=context)
         app = coco.App(
             coco.AppConfig(
-                name="CocoIndexCode",
+                name=APP_NAME,
                 environment=env,
             ),
             indexer_main,
@@ -441,6 +448,7 @@ class Project:
         result = Project.__new__(Project)
         result._env = env
         result._app = app
+        result._file_manifest_app = create_file_manifest_app(env)
         result._project_root = project_root
         result._index_lock = asyncio.Lock()
         result._clear_mps_cache_after_index = clear_mps_cache_after_index
