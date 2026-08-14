@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator, Callable
+from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import AsyncMock
 
@@ -56,12 +57,21 @@ class _ControlledProject(Project):  # type: ignore[misc]
             Any,
             _ControlledApp(_WatchHandle(on_enter=on_enter, on_exit=on_exit, release=release)),
         )
+        self.file_manifest_update = AsyncMock()
+        self._file_manifest_app = cast(
+            Any,
+            SimpleNamespace(update=self.file_manifest_update),
+        )
+        self.turboquant_warm = AsyncMock()
         self._index_lock = asyncio.Lock()
         self._clear_mps_cache_after_index = clear_mps_cache_after_index
         self._initial_index_done = asyncio.Event()
         self._initial_index_task = None
         self._initial_index_started = None
         self._indexing_stats = None
+
+    async def _warm_turboquant_index(self) -> None:
+        await self.turboquant_warm()
 
 
 async def test_projects_can_prepare_indexes_concurrently() -> None:
@@ -93,6 +103,10 @@ async def test_projects_can_prepare_indexes_concurrently() -> None:
     release.set()
     await asyncio.gather(first_task, second_task)
     assert active == 0
+    first.file_manifest_update.assert_awaited_once_with()
+    second.file_manifest_update.assert_awaited_once_with()
+    first.turboquant_warm.assert_awaited_once_with()
+    second.turboquant_warm.assert_awaited_once_with()
 
 
 async def test_concurrent_initial_index_requests_share_one_background_task() -> None:
@@ -117,6 +131,8 @@ async def test_concurrent_initial_index_requests_share_one_background_task() -> 
     release.set()
     await project.wait_for_indexing_done()
     assert execution_count == 1
+    project.file_manifest_update.assert_awaited_once_with()
+    project.turboquant_warm.assert_awaited_once_with()
 
 
 async def test_mps_allocator_cache_is_cleared_after_indexing(
